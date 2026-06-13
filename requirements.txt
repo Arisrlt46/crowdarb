@@ -6,4 +6,6 @@ anthropic
 python-dotenv
 streamlit
 requests
+yfinance
 jupyter
+yfinance
