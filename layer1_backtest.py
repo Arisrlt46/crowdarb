@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass, field
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
@@ -23,8 +24,10 @@ def generate_price_series(p0: float, n: int = 200, vol: float = 0.02, seed: int 
 @dataclass
 class Fill:
     t: int
-    side: str   # "buy" (we buy) or "sell" (we sell)
+    side: str        # "buy" (we buy) or "sell" (we sell)
     price: float
+    pred: float      # belief.mean immediately before this fill
+    outcome: int     # 1 if YES signal (sell fill), 0 if NO signal (buy fill)
 
 
 @dataclass
@@ -55,22 +58,26 @@ def run_backtest(mm: NaiveMarketMaker, prices: np.ndarray) -> BacktestResult:
     for t, market_price in enumerate(prices):
         bid, ask, fair = mm.bid, mm.ask, mm.fair_value
         fill_side = None
+        outcome = None
 
         if market_price > ask:
             # Buyer lifts our ask — we sell YES: inventory down, cash up
             cash += ask
             inventory -= 1
             fill_side = "sell"
-            mm = mm.observe(1)  # buyer signals YES (bullish)
+            outcome = 1  # buyer signals YES
+            mm = mm.observe(1)
         elif market_price < bid:
             # Seller hits our bid — we buy YES: inventory up, cash down
             cash -= bid
             inventory += 1
             fill_side = "buy"
-            mm = mm.observe(0)  # seller signals NO (bearish)
+            outcome = 0  # seller signals NO
+            mm = mm.observe(0)
 
-        if fill_side:
-            fills.append(Fill(t=t, side=fill_side, price=ask if fill_side == "sell" else bid))
+        if fill_side is not None:
+            fill_price = ask if fill_side == "sell" else bid
+            fills.append(Fill(t=t, side=fill_side, price=fill_price, pred=fair, outcome=outcome))
 
         unrealized = inventory * market_price
         rows.append({
@@ -89,6 +96,42 @@ def run_backtest(mm: NaiveMarketMaker, prices: np.ndarray) -> BacktestResult:
     return BacktestResult(history=pd.DataFrame(rows), fills=fills)
 
 
+def brier_score(fills: list[Fill]) -> float:
+    """
+    Brier score: mean squared error between predicted probability and binary outcome.
+
+    BS = (1/N) * Σ (p_i - y_i)²
+
+    Range [0, 1]; 0 is perfect. A naive predictor always guessing 0.5 scores 0.25.
+    Each fill contributes one (prediction, outcome) pair: p_i is belief.mean before
+    the fill, y_i is 1 for a YES signal (buyer lifts ask) and 0 for a NO signal.
+    """
+    if not fills:
+        return float("nan")
+    errors = [(f.pred - f.outcome) ** 2 for f in fills]
+    return float(np.mean(errors))
+
+
+def log_loss(fills: list[Fill], eps: float = 1e-7) -> float:
+    """
+    Binary log-loss (cross-entropy): penalises confident wrong predictions logarithmically.
+
+    LL = -(1/N) * Σ [y_i * log(p_i) + (1 - y_i) * log(1 - p_i)]
+
+    Range [0, ∞); 0 is perfect. A coin-flip predictor always guessing 0.5 scores log(2) ≈ 0.693.
+    Log-loss is much harsher than Brier score for confident errors: predicting p=0.99 on a
+    NO outcome incurs -log(0.01) ≈ 4.6, versus a Brier penalty of only 0.98².
+    eps clips predictions away from 0 and 1 to avoid log(0).
+    """
+    if not fills:
+        return float("nan")
+    terms = []
+    for f in fills:
+        p = float(np.clip(f.pred, eps, 1.0 - eps))
+        terms.append(f.outcome * np.log(p) + (1 - f.outcome) * np.log(1 - p))
+    return float(-np.mean(terms))
+
+
 _SPARK = " ▁▂▃▄▅▆▇█"
 
 
@@ -105,6 +148,8 @@ def print_summary(result: BacktestResult, p0: float) -> None:
     df = result.history
     n_buys = sum(1 for f in result.fills if f.side == "buy")
     n_sells = sum(1 for f in result.fills if f.side == "sell")
+    bs = brier_score(result.fills)
+    ll = log_loss(result.fills)
     W = 54
 
     print()
@@ -120,18 +165,60 @@ def print_summary(result: BacktestResult, p0: float) -> None:
     print(f"  P&L std dev          : {result.pnl_std:.4f}")
     print(f"  P&L range            : {df['total_pnl'].min():+.4f} … {df['total_pnl'].max():+.4f}")
     print()
+    print(f"  Brier score          : {bs:.4f}  (0 = perfect, 0.25 = coin flip)")
+    print(f"  Log-loss             : {ll:.4f}  (0 = perfect, 0.693 = coin flip)")
+    print()
     print(f"  P&L curve  {_sparkline(df['total_pnl'])}")
     print(f"  Inventory  {_sparkline(df['inventory'].astype(float))}")
     print()
 
     if result.fills:
-        print(f"  {'t':>4}  {'side':<5}  {'price':>6}  {'inventory':>9}  {'total_pnl':>9}")
-        print(f"  {'-'*4}  {'-'*5}  {'-'*6}  {'-'*9}  {'-'*9}")
+        print(f"  {'t':>4}  {'side':<5}  {'price':>6}  {'pred':>6}  {'y':>2}  {'inv':>5}  {'pnl':>8}")
+        print(f"  {'-'*4}  {'-'*5}  {'-'*6}  {'-'*6}  {'-'*2}  {'-'*5}  {'-'*8}")
         for f in result.fills:
             row = df.iloc[f.t]
-            print(f"  {f.t:>4}  {f.side:<5}  {f.price:>6.4f}  {int(row['inventory']):>9}  {row['total_pnl']:>+9.4f}")
+            print(f"  {f.t:>4}  {f.side:<5}  {f.price:>6.4f}  {f.pred:>6.4f}  {f.outcome:>2}  "
+                  f"{int(row['inventory']):>5}  {row['total_pnl']:>+8.4f}")
 
     print("=" * W)
+
+
+def plot_results(result: BacktestResult, p0: float) -> None:
+    """Three-panel chart: price + quotes, cumulative P&L, inventory."""
+    df = result.history
+    fig, axes = plt.subplots(3, 1, figsize=(12, 9), sharex=True)
+    fig.suptitle("CrowdArb Layer 1 — Naive Symmetric Market-Maker", fontsize=13, fontweight="bold")
+
+    # Panel 1: market price, fair value, bid-ask band, fill markers
+    ax = axes[0]
+    ax.plot(df["t"], df["market_price"], color="black", lw=1, label="Market price")
+    ax.plot(df["t"], df["fair_value"], color="steelblue", lw=1.2, label="Fair value")
+    ax.fill_between(df["t"], df["bid"], df["ask"], alpha=0.2, color="steelblue", label="Bid-ask spread")
+    buys = df[df["fill"] == "buy"]
+    sells = df[df["fill"] == "sell"]
+    ax.scatter(buys["t"], buys["bid"], marker="^", color="green", s=35, zorder=5, label="Buy fill")
+    ax.scatter(sells["t"], sells["ask"], marker="v", color="red", s=35, zorder=5, label="Sell fill")
+    ax.set_ylabel("Price")
+    ax.set_ylim(0, 1)
+    ax.legend(fontsize=8, loc="upper right")
+
+    # Panel 2: cumulative total P&L (cash + mark-to-market inventory)
+    ax = axes[1]
+    ax.plot(df["t"], df["total_pnl"], color="darkorange", lw=1.2)
+    ax.axhline(0, color="black", lw=0.5, ls="--")
+    ax.set_ylabel("Total P&L")
+
+    # Panel 3: YES inventory held over time
+    ax = axes[2]
+    ax.step(df["t"], df["inventory"], color="purple", lw=1.2, where="post")
+    ax.axhline(0, color="black", lw=0.5, ls="--")
+    ax.set_ylabel("Inventory")
+    ax.set_xlabel("Timestep")
+
+    plt.tight_layout()
+    plt.savefig("layer1_backtest.png", dpi=150)
+    print("  Chart saved to layer1_backtest.png")
+    plt.show()
 
 
 def main():
@@ -150,7 +237,9 @@ def main():
 
     print_summary(result, p_poly)
     result.history.to_csv("layer1_backtest.csv", index=False)
-    print(f"  History saved to layer1_backtest.csv")
+    print(f"  History saved to layer1_backtest.csv\n")
+
+    plot_results(result, p_poly)
 
 
 if __name__ == "__main__":
