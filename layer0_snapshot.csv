@@ -1,0 +1,2 @@
+timestamp,date,polymarket_question,polymarket_p_any_cut,cme_meeting,cme_ticker,cme_rate_proxy_pct,cme_futures_implied_pct,cme_p_cut_next_meeting,gap_poly_minus_cme
+2026-06-09T19:06:15.127832+00:00,2026-06-09,Will no Fed rate cuts happen in 2026?,0.2015,2026-06-18,ZQM26.CBT,3.6349997520446777,3.6200027465820312,0.13843389657827565,0.06306610342172436
