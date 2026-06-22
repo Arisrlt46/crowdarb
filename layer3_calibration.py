@@ -185,28 +185,33 @@ def plot_calibration(df: pd.DataFrame, live_blend: float = None) -> None:
     print("  Chart saved to layer3_calibration.png")
 
 
+BACKTEST_SEED = 7   # fixed seed for generate_synthetic_pairs; keeps Brier results reproducible
+
+
 def main():
     from layer0_compare import fetch_cme, fetch_polymarket
     from datetime import date
 
-    # Live snapshot: show current blended estimate at equal weights
-    print("Fetching live data...")
-    _, p_poly_live = fetch_polymarket()
-    today = date.today()
-    _, _, _, _, p_cme_live = fetch_cme(today)
-
-    blender_live = BayesianBlender(source_names=["polymarket", "cme"], eta=0.1)
-    p_blend_live = blender_live.blend([p_poly_live, p_cme_live])
-
-    print()
-    print(f"  Polymarket P(any cut in 2026) : {p_poly_live:.4f}")
-    print(f"  CME P(cut at next FOMC)       : {p_cme_live:.4f}")
-    print(f"  Blended (equal weights)        : {p_blend_live:.4f}")
-    print()
+    # Live snapshot (display only — does not affect backtest metrics)
+    p_blend_live = None
+    try:
+        print("Fetching live data...")
+        _, p_poly_live = fetch_polymarket()
+        today = date.today()
+        _, _, _, _, p_cme_live = fetch_cme(today)
+        blender_live = BayesianBlender(source_names=["polymarket", "cme"], eta=0.1)
+        p_blend_live = blender_live.blend([p_poly_live, p_cme_live])
+        print()
+        print(f"  Polymarket P(any cut in 2026) : {p_poly_live:.4f}")
+        print(f"  CME P(cut at next FOMC)       : {p_cme_live:.4f}")
+        print(f"  Blended (equal weights)        : {p_blend_live:.4f}")
+        print()
+    except Exception as e:
+        print(f"  Live fetch skipped: {e}\n")
 
     # Synthetic calibration backtest to demonstrate weight learning and Brier improvement
-    print("Running 200-step calibration backtest (synthetic, p_true=0.30)...")
-    p_poly_sim, p_cme_sim, outcomes_sim = generate_synthetic_pairs(n=200, p_true=0.30)
+    print("Running 200-step calibration backtest (synthetic, p_true=0.30, seed=7)...")
+    p_poly_sim, p_cme_sim, outcomes_sim = generate_synthetic_pairs(n=200, p_true=0.30, seed=BACKTEST_SEED)
     df = run_calibration_backtest(p_poly_sim, p_cme_sim, outcomes_sim, eta=0.1)
 
     # Reconstruct final blender state to read terminal weights
