@@ -73,23 +73,32 @@ def cut_probability(meeting: date, r_current: float) -> float:
 
     Implied monthly average = (days_before * r_current + days_after * r_after) / N
     Solving for r_after and comparing to r_current - 0.25 gives P(cut).
+
+    Near-month-end fallback: when days_after < 5, back-solving amplifies noise by
+    N/days_after (up to 15× for a day-30 meeting), producing probabilities > 1.
+    CME's own methodology handles this by reading the next month's ZQ contract
+    directly as r_after — its full 31-day window is entirely post-decision.
     """
     N = calendar.monthrange(meeting.year, meeting.month)[1]  # days in meeting month
     D = meeting.day
     days_before = D - 1
-    days_after = N - D + 1
+    days_after  = N - D + 1
 
     r_implied = get_futures_implied_rate(meeting.year, meeting.month)
 
-    # Expected post-meeting rate derived from futures
-    # r_implied = (days_before * r_current + days_after * r_after) / N
-    r_after = (r_implied * N - days_before * r_current) / days_after
+    if days_after < 5:
+        # Switch to next-month ZQ: all its days are post-decision, so its implied
+        # rate is a direct, stable read on r_after without division-by-small-number.
+        nm = meeting.month % 12 + 1
+        ny = meeting.year + (1 if meeting.month == 12 else 0)
+        r_after = get_futures_implied_rate(ny, nm)
+    else:
+        # Standard back-solve: r_implied = (days_before*r_current + days_after*r_after) / N
+        r_after = (r_implied * N - days_before * r_current) / days_after
 
-    # r_after = P(cut) * (r_current - 0.25) + (1 - P(cut)) * r_current
-    #         = r_current - P(cut) * 0.25
-    # => P(cut) = (r_current - r_after) / 0.25
+    # r_after = r_current - P(cut) * 0.25  =>  P(cut) = (r_current - r_after) / 0.25
     prob = (r_current - r_after) / 0.25
-    return max(0.0, min(1.0, prob))  # clamp: futures noise can push outside [0, 1]
+    return max(0.0, min(1.0, prob))  # clamp residual futures noise
 
 
 def main():

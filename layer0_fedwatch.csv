@@ -1,2 +1,2 @@
 timestamp,source,meeting_date,rate_proxy_pct,futures_implied_rate_pct,cut_probability
-2026-06-09T18:47:39.237065+00:00,CME ZQ futures via yfinance,2026-06-18,3.6349997520446777,3.62249755859375,0.115404862623949
+2026-06-26T23:24:29.179648+00:00,CME ZQ futures via yfinance,2026-07-30,3.6630001068115234,3.6350021362304688,0.0
