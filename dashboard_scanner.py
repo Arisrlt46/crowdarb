@@ -1,4 +1,4 @@
-"""CrowdArb Phase E — multi-market scanner dashboard."""
+"""CrowdArb Phase G5 — multi-market scanner dashboard with auto-discovery."""
 
 import os
 
@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from market_pair import BitcoinMarket, EthereumMarket, FedRateMarket
+from market_pair import discover_markets
 from layer1_backtest import generate_price_series
 from layer1_belief import BetaBelief
 from layer2_avellaneda import ASParams, AvellanedaStoikovMM, estimate_sigma2
@@ -20,33 +20,39 @@ from layer4_llm_signal import lr_update, score_headline
 st.set_page_config(page_title="CrowdArb Scanner", layout="wide")
 st.title("CrowdArb — Multi-Market Scanner")
 
-# ── Cached market loaders ─────────────────────────────────────────────────────
-# Each returns (p_poly, p_prof, meta, error_str|None); refreshes at most once/min.
+# ── Discovery + data loading ──────────────────────────────────────────────────
+# One cached call covers the full Gamma scan AND per-market live data fetch.
+# 300s TTL: a cold scan + data fetch takes ~15 s; 5-min staleness is acceptable.
+# Returns list[tuple]: (name, p_poly, p_prof, meta, error_str | None)
 
-@st.cache_data(ttl=60)
-def load_fed():
+@st.cache_data(ttl=300)
+def discover_and_load() -> list[tuple]:
+    """Discover markets from live catalogue then fetch probabilities for each."""
     try:
-        m = FedRateMarket()
-        return m.get_polymarket_probability(), m.get_professional_probability(), m.metadata(), None
+        pairs = discover_markets(min_volume_usd=50_000, min_days=30)
     except Exception as exc:
-        return None, None, {"name": "Fed Rate Cut 2026", "description": "—", "resolution_date": "—"}, str(exc)
+        return [("Discovery", None, None,
+                 {"name": "Discovery failed", "description": str(exc),
+                  "resolution_date": "—"}, str(exc))]
 
-@st.cache_data(ttl=60)
-def load_btc():
-    try:
-        m = BitcoinMarket()
-        return m.get_polymarket_probability(), m.get_professional_probability(), m.metadata(), None
-    except Exception as exc:
-        return None, None, {"name": "Bitcoin Price Level", "description": "—", "resolution_date": "—"}, str(exc)
+    results: list[tuple] = []
+    for mp in pairs:
+        # Use class name as fallback so errors are identifiable even without metadata
+        fallback_name = type(mp).__name__
+        fallback_meta = {"name": fallback_name, "description": "—", "resolution_date": "—"}
+        try:
+            p_poly = mp.get_polymarket_probability()
+            p_prof = mp.get_professional_probability()
+            meta   = mp.metadata()
+            results.append((meta["name"], p_poly, p_prof, meta, None))
+        except Exception as exc:
+            # If _ensure_loaded() failed, metadata() would fail too — use fallback
+            results.append((fallback_name, None, None, fallback_meta, str(exc)))
 
-@st.cache_data(ttl=60)
-def load_eth():
-    try:
-        m = EthereumMarket()
-        return m.get_polymarket_probability(), m.get_professional_probability(), m.metadata(), None
-    except Exception as exc:
-        return None, None, {"name": "Ethereum Price Level", "description": "—", "resolution_date": "—"}, str(exc)
+    return results
 
+
+# ── Deterministic helpers (cached indefinitely — inputs fully determine outputs) ─
 
 @st.cache_data
 def _hedge_trusted(p_poly: float, p_prof: float) -> str:
@@ -74,23 +80,17 @@ def _as_quotes(p_blend: float):
     return mm.bid, mm.ask, mm.spread, mm.reservation_price
 
 
-# ── Load all markets ──────────────────────────────────────────────────────────
+# ── Load markets ──────────────────────────────────────────────────────────────
 
 hdr_col, btn_col = st.columns([6, 1])
 hdr_col.subheader("Market Scanner")
 with btn_col:
     st.write("")
     if st.button("↺ Refresh"):
-        load_fed.clear()
-        load_btc.clear()
-        load_eth.clear()
+        discover_and_load.clear()
         st.rerun()
 
-market_data: dict[str, tuple] = {
-    "Fed Rate Cut 2026":    load_fed(),
-    "Bitcoin Price Level":  load_btc(),
-    "Ethereum Price Level": load_eth(),
-}
+market_results = discover_and_load()   # list of (name, p_poly, p_prof, meta, err|None)
 
 # ── Scanner table ─────────────────────────────────────────────────────────────
 
@@ -99,30 +99,19 @@ def _pct(v) -> str:
         return "—"
     return f"{v:.1%}"
 
-rows = []
+rows       = []
 load_errors = []
 
-for name, (p_poly, p_prof, meta, err) in market_data.items():
+for name, p_poly, p_prof, meta, err in market_results:
     if err:
-        load_errors.append((meta.get("name", name), err))
-        rows.append({
-            "Market":          meta.get("name", name),
-            "Polymarket":      None,
-            "Professional":    None,
-            "|Gap|":           None,
-            "Trusted (Hedge)": "—",
-            "_sort":           -1.0,
-        })
+        load_errors.append((name, err))
+        rows.append({"Market": name, "Polymarket": None, "Professional": None,
+                     "|Gap|": None, "Trusted (Hedge)": "—", "_sort": -1.0})
     else:
         gap = abs(p_poly - p_prof)
-        rows.append({
-            "Market":          meta["name"],
-            "Polymarket":      p_poly,
-            "Professional":    p_prof,
-            "|Gap|":           gap,
-            "Trusted (Hedge)": _hedge_trusted(p_poly, p_prof),
-            "_sort":           gap,
-        })
+        rows.append({"Market": name, "Polymarket": p_poly, "Professional": p_prof,
+                     "|Gap|": gap, "Trusted (Hedge)": _hedge_trusted(p_poly, p_prof),
+                     "_sort": gap})
 
 df_raw = (
     pd.DataFrame(rows)
@@ -131,12 +120,14 @@ df_raw = (
     .reset_index(drop=True)
 )
 
-# Build a display copy with percentage strings
 display_df = df_raw.copy()
 for col in ["Polymarket", "Professional", "|Gap|"]:
     display_df[col] = display_df[col].apply(_pct)
 
 st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+n_ok = sum(1 for *_, err in market_results if err is None)
+st.caption(f"Discovered {n_ok} market(s) from live Polymarket scan · cache TTL 300 s")
 
 for mkt_name, err_msg in load_errors:
     st.caption(f"⚠ {mkt_name}: {err_msg}")
@@ -146,15 +137,19 @@ for mkt_name, err_msg in load_errors:
 st.divider()
 st.subheader("Market Detail")
 
-ok_markets = [name for name, (_, _, _, err) in market_data.items() if err is None]
+ok_markets = {
+    name: (p_poly, p_prof, meta)
+    for name, p_poly, p_prof, meta, err in market_results
+    if err is None
+}
 
 if not ok_markets:
     st.warning("No markets loaded successfully. Check API connectivity and try refreshing.")
     st.stop()
 
-selected = st.selectbox("Select market", ok_markets)
-p_poly, p_prof, meta, _ = market_data[selected]
-p_blend = 0.5 * p_poly + 0.5 * p_prof
+selected = st.selectbox("Select market", list(ok_markets))
+p_poly, p_prof, meta = ok_markets[selected]
+p_blend    = 0.5 * p_poly + 0.5 * p_prof
 gap_signed = p_poly - p_prof
 
 st.caption(
@@ -164,7 +159,6 @@ st.caption(
 )
 st.write("")
 
-# Live probability metrics
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Polymarket",        f"{p_poly:.1%}")
 c2.metric("Professional",      f"{p_prof:.1%}")
@@ -173,7 +167,6 @@ c4.metric("Blended (50/50)",   f"{p_blend:.1%}")
 
 st.divider()
 
-# A-S quotes derived from the blended prior
 st.subheader("Avellaneda-Stoikov Quotes")
 bid, ask, spread, r_price = _as_quotes(p_blend)
 q1, q2, q3, q4 = st.columns(4)
@@ -185,10 +178,10 @@ st.caption(f"From blended prior p₀ = {p_blend:.4f}, zero inventory, γ=10, k=4
 
 st.divider()
 
-# LLM headline scorer — session state scoped per market so results persist across market switches
+# LLM scorer — session state scoped per market so results persist across market switches
 st.subheader("LLM Headline Scorer")
 
-scorer_key  = f"llm_{selected}"
+scorer_key   = f"llm_{selected}"
 headline_key = f"headline_{selected}"
 if scorer_key not in st.session_state:
     st.session_state[scorer_key] = None

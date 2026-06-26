@@ -4,14 +4,13 @@ from __future__ import annotations
 
 from layer0_bitcoin import (
     _is_reach_contract,
-    _parse_end_date,
-    _parse_strike,
     fetch_btc_price,
     fetch_deribit_dvol,
     fetch_tnx,
     historical_vol_btc,
 )
 from layer0_bs import implied_probability_above, years_to
+from layer0_classifier import parse_end_date, parse_strike
 from layer0_markets import find_markets
 from layer1_backtest import brier_score, generate_price_series, log_loss, print_summary, run_backtest
 from layer1_belief import BetaBelief, NaiveMarketMaker
@@ -31,15 +30,20 @@ def fetch_bitcoin_probs() -> tuple[float, float, float, dict]:
     """
     all_btc  = find_markets(["bitcoin", "btc"])
     reach    = [m for m in all_btc if _is_reach_contract(m)]
-    eligible = [m for m in reach if (years_to(_parse_end_date(m)) * 365) >= MIN_DAYS]
+    eligible = [
+        m for m in reach
+        if (d := parse_end_date(m)) is not None and years_to(d) * 365 >= MIN_DAYS
+    ]
     if not eligible:
         raise RuntimeError(f"No BTC upside contracts with ≥{MIN_DAYS} days remaining.")
 
     best      = eligible[0]   # sorted by volume descending
     poly_prob = best["_yes_prob"] or 0.0
     question  = best.get("question", "")
-    K         = _parse_strike(question)
-    T         = years_to(_parse_end_date(best))
+    K         = parse_strike(question)
+    if K is None:
+        raise RuntimeError(f"Cannot parse strike from: {question!r}")
+    T         = years_to(parse_end_date(best))
 
     S = fetch_btc_price()
     r = fetch_tnx()

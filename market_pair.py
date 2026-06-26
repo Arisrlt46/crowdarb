@@ -1,5 +1,5 @@
 """
-CrowdArb Phase C — MarketPair interface and unified pipeline runner.
+CrowdArb Phase C/D — MarketPair interface and unified pipeline runner.
 
 Abstract base class defines the three-method contract every market must fulfil.
 Concrete implementations wrap the existing Layer 0 data fetchers.
@@ -8,6 +8,7 @@ run_crowdarb() runs the full Layer 1-3 pipeline on any MarketPair.
 
 from __future__ import annotations
 
+import re
 from abc import ABC, abstractmethod
 from datetime import date
 
@@ -19,15 +20,25 @@ from layer0_compare import fetch_cme, fetch_polymarket
 # Layer 0 — Bitcoin sources
 from layer0_bitcoin import (
     _is_reach_contract,
-    _parse_end_date,
-    _parse_strike,
     fetch_btc_price,
     fetch_deribit_dvol,
     fetch_tnx,
     historical_vol_btc,
 )
+
+# Layer 0 — Ethereum sources
+from layer0_ethereum import (
+    fetch_deribit_eth_dvol,
+    fetch_eth_price,
+    historical_vol_eth,
+    _is_reach_contract as _eth_is_reach_contract,
+)
+
+# Shared classifier + parsers (G1/G2)
+from layer0_classifier import classify_market, parse_end_date, parse_strike
+
 from layer0_bs import implied_probability_above, years_to
-from layer0_markets import find_markets
+from layer0_markets import _iter_active_markets, find_markets
 
 # Layers 1-3
 from layer1_backtest import brier_score, generate_price_series, log_loss, run_backtest
@@ -132,17 +143,21 @@ class BitcoinMarket(MarketPair):
         # Contract discovery
         all_btc  = find_markets(["bitcoin", "btc"])
         reach    = [m for m in all_btc if _is_reach_contract(m)]
-        eligible = [m for m in reach
-                    if (years_to(_parse_end_date(m)) * 365) >= self.MIN_DAYS]
+        eligible = [
+            m for m in reach
+            if (d := parse_end_date(m)) is not None and years_to(d) * 365 >= self.MIN_DAYS
+        ]
         if not eligible:
             raise RuntimeError(f"No BTC upside contracts with ≥{self.MIN_DAYS} days remaining.")
 
         best              = eligible[0]   # sorted by volume descending
         self._p_poly      = best["_yes_prob"] or 0.0
         self._question    = best.get("question", "")
-        self._resolution_date = _parse_end_date(best)
+        self._resolution_date = parse_end_date(best)
 
-        K = _parse_strike(self._question)
+        K = parse_strike(self._question)
+        if K is None:
+            raise RuntimeError(f"Cannot parse strike from: {self._question!r}")
         T = years_to(self._resolution_date)
         S = fetch_btc_price()
         r = fetch_tnx()
@@ -169,6 +184,79 @@ class BitcoinMarket(MarketPair):
         self._ensure_loaded()
         return {
             "name":            "Bitcoin Price Level",
+            "description":     self._question,
+            "resolution_date": self._resolution_date,
+            "poly_source":     "Polymarket Gamma API",
+            "prof_source":     f"Black-Scholes ({self._sigma_source})",
+        }
+
+
+
+# ── Concrete implementation: Ethereum price level ─────────────────────────────
+
+class EthereumMarket(MarketPair):
+    """
+    Highest-volume Polymarket ETH 'reach $X' contract (≥90 days) vs Black-Scholes.
+    Uses Deribit ETH DVOL for implied vol; falls back to 90-day historical vol.
+    """
+
+    MIN_DAYS = 90
+
+    def __init__(self) -> None:
+        self._loaded          = False
+        self._p_poly          = 0.0
+        self._p_bs            = 0.0
+        self._question        = ""
+        self._resolution_date : date = date.today()
+        self._sigma_source    = ""
+
+    def _ensure_loaded(self) -> None:
+        if self._loaded:
+            return
+
+        all_eth  = find_markets(["ethereum", "eth"])
+        reach    = [m for m in all_eth if _eth_is_reach_contract(m)]
+        eligible = [
+            m for m in reach
+            if (d := parse_end_date(m)) is not None and years_to(d) * 365 >= self.MIN_DAYS
+        ]
+        if not eligible:
+            raise RuntimeError(f"No ETH upside contracts with ≥{self.MIN_DAYS} days remaining.")
+
+        best              = eligible[0]
+        self._p_poly      = best["_yes_prob"] or 0.0
+        self._question    = best.get("question", "")
+        self._resolution_date = parse_end_date(best)
+
+        K = parse_strike(self._question)
+        if K is None:
+            raise RuntimeError(f"Cannot parse strike from: {self._question!r}")
+        T = years_to(self._resolution_date)
+        S = fetch_eth_price()
+        r = fetch_tnx()   # reuse BTC module's ^TNX fetcher (identical call)
+
+        try:
+            sigma              = fetch_deribit_eth_dvol()
+            self._sigma_source = "Deribit ETH DVOL"
+        except Exception:
+            sigma              = historical_vol_eth(lookback_days=90)
+            self._sigma_source = "ETH historical (90d)"
+
+        self._p_bs   = implied_probability_above(S, K, T, r, sigma, q=0.0)
+        self._loaded = True
+
+    def get_polymarket_probability(self) -> float:
+        self._ensure_loaded()
+        return self._p_poly
+
+    def get_professional_probability(self) -> float:
+        self._ensure_loaded()
+        return self._p_bs
+
+    def metadata(self) -> dict:
+        self._ensure_loaded()
+        return {
+            "name":            "Ethereum Price Level",
             "description":     self._question,
             "resolution_date": self._resolution_date,
             "poly_source":     "Polymarket Gamma API",
@@ -272,16 +360,207 @@ def run_crowdarb(
     print("=" * W)
 
 
-# ── Demo: run both markets ────────────────────────────────────────────────────
+# ── Market auto-discovery (G3) ────────────────────────────────────────────────
+
+# Ticker patterns used by _btc_or_eth(); word boundaries prevent "beth" / "btcoin" matches
+_BTC_RE = re.compile(r"\bbtc\b|bitcoin", re.IGNORECASE)
+_ETH_RE = re.compile(r"\beth\b|ethereum", re.IGNORECASE)
+
+# BS uncertainty bounds: skip contracts where the professional probability is near-certain
+# in either direction — no meaningful crowd-vs-professional comparison is possible there.
+_BS_P_MIN = 0.02
+_BS_P_MAX = 0.98
+
+
+def _btc_or_eth(question: str) -> str | None:
+    """Return 'BTC', 'ETH', or None — identifies the underlying in a crypto_level contract."""
+    if _BTC_RE.search(question):
+        return "BTC"
+    if _ETH_RE.search(question):
+        return "ETH"
+    return None
+
+
+def discover_markets(
+    min_volume_usd: float = 50_000,
+    min_days: int = 30,
+    max_pages: int = 30,
+) -> list[MarketPair]:
+    """
+    Scan the live Polymarket catalogue and return a MarketPair for every supported
+    contract that passes volume, expiry, and BS uncertainty filters.
+
+    Strategy:
+      1. Pre-fetch spot price, implied vol, and risk-free rate for BTC and ETH once.
+      2. Paginate all active markets; classify each contract.
+      3. For crypto_level: apply volume, expiry, and BS sanity filter —
+         skip any contract where P(BS) < _BS_P_MIN or > _BS_P_MAX (no meaningful
+         crowd-vs-professional comparison when the outcome is near-certain).
+         For rate_decision: volume filter only (FedRateMarket owns date logic).
+      4. De-duplicate: one winner per (tag, ticker) group — highest volume wins.
+      5. Instantiate the appropriate MarketPair subclass for each winner.
+
+    Note: BitcoinMarket / EthereumMarket re-discover the contract internally on first
+    access. G4 will replace them with a CryptoLevelMarket that accepts pre-fetched data.
+    """
+    today = date.today()
+
+    # ── Pre-fetch market data for the BS filter (once per asset) ──────────────
+    print("  Pre-fetching market data for BS uncertainty filter...")
+    r = 0.0
+    try:
+        r = fetch_tnx()
+    except Exception:
+        pass
+
+    spot:  dict[str, float | None] = {"BTC": None, "ETH": None}
+    sigma: dict[str, float | None] = {"BTC": None, "ETH": None}
+
+    try:
+        spot["BTC"] = fetch_btc_price()
+        try:
+            sigma["BTC"] = fetch_deribit_dvol()
+        except Exception:
+            sigma["BTC"] = historical_vol_btc(90)
+    except Exception as exc:
+        print(f"  Warning: BTC data unavailable ({exc}); BTC contracts skipped.")
+
+    try:
+        spot["ETH"] = fetch_eth_price()
+        try:
+            sigma["ETH"] = fetch_deribit_eth_dvol()
+        except Exception:
+            sigma["ETH"] = historical_vol_eth(90)
+    except Exception as exc:
+        print(f"  Warning: ETH data unavailable ({exc}); ETH contracts skipped.")
+
+    for ticker in ("BTC", "ETH"):
+        S, sig = spot[ticker], sigma[ticker]
+        if S is not None and sig is not None:
+            print(f"    {ticker}: S=${S:,.0f}  σ={sig:.1%}")
+        else:
+            print(f"    {ticker}: unavailable")
+    print(f"    r={r:.4f}  ({r*100:.2f}%)\n")
+
+    # ── Scan, classify, filter ─────────────────────────────────────────────────
+    # Each record: {"volume": float, "question": str, "p_bs": float|None, "market": dict}
+    best: dict[tuple[str, str], dict] = {}
+    n_bs_filtered = 0
+
+    for market in _iter_active_markets(max_pages=max_pages):
+        tag = classify_market(market)
+        if tag in ("unsupported", "equity_level"):
+            continue
+
+        vol = float(market.get("volume") or 0)
+        if vol < min_volume_usd:
+            continue
+
+        question = market.get("question") or ""
+        p_bs: float | None = None
+
+        if tag == "crypto_level":
+            ticker = _btc_or_eth(question)
+            if ticker is None:
+                continue
+
+            K = parse_strike(question)
+            if K is None:
+                continue
+
+            end_date = parse_end_date(market)
+            if end_date is None or (end_date - today).days < min_days:
+                continue
+
+            S   = spot.get(ticker)
+            sig = sigma.get(ticker)
+            if S is None or sig is None:
+                continue
+
+            p_bs = implied_probability_above(S, K, years_to(end_date), r, sig, q=0.0)
+            if not (_BS_P_MIN <= p_bs <= _BS_P_MAX):
+                n_bs_filtered += 1
+                continue
+
+            key: tuple[str, str] = (tag, ticker)
+
+        elif tag == "rate_decision":
+            key = (tag, "FED")
+
+        else:
+            continue
+
+        record = {"volume": vol, "question": question, "p_bs": p_bs, "market": market}
+        if key not in best or vol > best[key]["volume"]:
+            best[key] = record
+
+    # ── Discovery summary ─────────────────────────────────────────────────────
+    W = 66
+    bs_range = f"BS∈[{_BS_P_MIN:.0%},{_BS_P_MAX:.0%}]"
+    print(f"\n{'─' * W}")
+    print(f"  discover_markets()  "
+          f"[vol≥${min_volume_usd/1_000:.0f}k  days≥{min_days}  {bs_range}  pages={max_pages}]")
+    print(f"{'─' * W}")
+
+    sorted_groups = sorted(best.items(), key=lambda kv: kv[1]["volume"], reverse=True)
+
+    if not sorted_groups:
+        print(f"  No supported markets found.  ({n_bs_filtered} dropped by BS filter)")
+        print(f"{'─' * W}\n")
+        return []
+
+    print(f"  {'Type':<18}  {'Asset':<5}  {'P(BS)':>6}  {'Volume':>12}  Question (truncated)")
+    print(f"  {'─'*18}  {'─'*5}  {'─'*6}  {'─'*12}  {'─'*36}")
+    for (tag, ticker), rec in sorted_groups:
+        p_str = f"{rec['p_bs']:.1%}" if rec["p_bs"] is not None else "    —"
+        q     = rec["question"][:48]
+        print(f"  {tag:<18}  {ticker:<5}  {p_str:>6}  ${rec['volume']:>11,.0f}  {q}")
+    print(f"{'─' * W}")
+    print(f"  {len(sorted_groups)} selected  |  {n_bs_filtered} dropped by BS filter  "
+          f"(P(BS) < {_BS_P_MIN:.0%} or > {_BS_P_MAX:.0%})")
+    print(f"{'─' * W}\n")
+
+    # ── Instantiate ───────────────────────────────────────────────────────────
+    pairs: list[MarketPair] = []
+    for (tag, ticker), _ in sorted_groups:
+        if tag == "crypto_level" and ticker == "BTC":
+            pairs.append(BitcoinMarket())
+        elif tag == "crypto_level" and ticker == "ETH":
+            pairs.append(EthereumMarket())
+        elif tag == "rate_decision":
+            pairs.append(FedRateMarket())
+
+    return pairs
+
+
+# ── Demo entrypoints ──────────────────────────────────────────────────────────
 
 def main() -> None:
-    print("CrowdArb — market-agnostic pipeline demo")
-    print("Fetching live data for both markets...\n")
+    """Phase D demo: run the full pipeline on the three hardcoded markets."""
+    print("CrowdArb — market-agnostic pipeline demo (Phase D)")
+    print("Fetching live data for all three markets...\n")
 
-    for market in [FedRateMarket(), BitcoinMarket()]:
+    for market in [FedRateMarket(), BitcoinMarket(), EthereumMarket()]:
+        run_crowdarb(market, seed=42, n_steps=200)
+        print()
+
+
+def discover_main() -> None:
+    """G3 demo: auto-discover markets from the live catalogue, then run the pipeline."""
+    print("CrowdArb G3 — market auto-discovery")
+    print("=" * 66)
+
+    pairs = discover_markets(min_volume_usd=50_000, min_days=30)
+
+    if not pairs:
+        print("No supported markets discovered.")
+        return
+
+    print(f"Running pipeline on {len(pairs)} discovered market(s)...\n")
+    for market in pairs:
         run_crowdarb(market, seed=42, n_steps=200)
         print()
 
 
 if __name__ == "__main__":
-    main()
+    discover_main()
