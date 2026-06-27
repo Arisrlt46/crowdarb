@@ -38,7 +38,7 @@ from layer0_ethereum import (
 from layer0_classifier import classify_market, parse_end_date, parse_strike
 
 from layer0_bs import implied_probability_above, years_to
-from layer0_markets import _iter_active_markets, find_markets
+from layer0_markets import _extract_yes_prob, _iter_active_markets, find_markets
 
 # Layers 1-3
 from layer1_backtest import brier_score, generate_price_series, log_loss, run_backtest
@@ -368,7 +368,7 @@ _ETH_RE = re.compile(r"\beth\b|ethereum", re.IGNORECASE)
 
 # BS uncertainty bounds: skip contracts where the professional probability is near-certain
 # in either direction — no meaningful crowd-vs-professional comparison is possible there.
-_BS_P_MIN = 0.02
+_BS_P_MIN = 0.005
 _BS_P_MAX = 0.98
 
 
@@ -405,47 +405,65 @@ def discover_markets(
     """
     today = date.today()
 
-    # ── Pre-fetch market data for the BS filter (once per asset) ──────────────
-    print("  Pre-fetching market data for BS uncertainty filter...")
+    # ── Pre-fetch market data (once per asset) ────────────────────────────────
+    print("  Pre-fetching market data...")
     r = 0.0
     try:
         r = fetch_tnx()
     except Exception:
         pass
 
-    spot:  dict[str, float | None] = {"BTC": None, "ETH": None}
-    sigma: dict[str, float | None] = {"BTC": None, "ETH": None}
+    spot:      dict[str, float | None] = {"BTC": None, "ETH": None}
+    sigma:     dict[str, float | None] = {"BTC": None, "ETH": None}
+    sigma_src: dict[str, str]          = {"BTC": "unavailable", "ETH": "unavailable"}
 
     try:
         spot["BTC"] = fetch_btc_price()
         try:
             sigma["BTC"] = fetch_deribit_dvol()
+            sigma_src["BTC"] = "Deribit DVOL"
         except Exception:
             sigma["BTC"] = historical_vol_btc(90)
+            sigma_src["BTC"] = "BTC historical (90d)"
     except Exception as exc:
-        print(f"  Warning: BTC data unavailable ({exc}); BTC contracts skipped.")
+        print(f"  Warning: BTC data unavailable ({exc})")
 
     try:
         spot["ETH"] = fetch_eth_price()
         try:
             sigma["ETH"] = fetch_deribit_eth_dvol()
+            sigma_src["ETH"] = "Deribit ETH DVOL"
         except Exception:
             sigma["ETH"] = historical_vol_eth(90)
+            sigma_src["ETH"] = "ETH historical (90d)"
     except Exception as exc:
-        print(f"  Warning: ETH data unavailable ({exc}); ETH contracts skipped.")
+        print(f"  Warning: ETH data unavailable ({exc})")
+
+    # CME + Polymarket probabilities for rate_decision (fetched once, used for all Fed rows)
+    p_poly_fed: float | None = None
+    p_prof_fed: float | None = None
+    fed_question: str        = "P(any Fed rate cut in 2026)"
+    fed_source: str          = "CME ZQ futures"
+    try:
+        fed_question, p_poly_fed = fetch_polymarket()
+        meeting_d, _, _, _, p_prof_fed = fetch_cme(today)
+        fed_source = f"CME ZQ futures (meeting {meeting_d})"
+    except Exception as exc:
+        print(f"  Warning: Fed data unavailable ({exc})")
 
     for ticker in ("BTC", "ETH"):
         S, sig = spot[ticker], sigma[ticker]
         if S is not None and sig is not None:
-            print(f"    {ticker}: S=${S:,.0f}  σ={sig:.1%}")
+            print(f"    {ticker}: S=${S:,.0f}  σ={sig:.1%}  [{sigma_src[ticker]}]")
         else:
             print(f"    {ticker}: unavailable")
     print(f"    r={r:.4f}  ({r*100:.2f}%)\n")
 
-    # ── Scan, classify, filter ─────────────────────────────────────────────────
-    # Each record: {"volume": float, "question": str, "p_bs": float|None, "market": dict}
-    best: dict[tuple[str, str], dict] = {}
-    n_bs_filtered = 0
+    # ── Scan, classify, collect all passing contracts ─────────────────────────
+    records:       list[dict] = []
+    seen_questions: set[str]  = set()   # exact-duplicate guard (same contract, two API pages)
+    fed_added      = False              # include at most one Fed entry
+    n_bs_filtered  = 0
 
     for market in _iter_active_markets(max_pages=max_pages):
         tag = classify_market(market)
@@ -457,7 +475,8 @@ def discover_markets(
             continue
 
         question = market.get("question") or ""
-        p_bs: float | None = None
+        if question in seen_questions:
+            continue
 
         if tag == "crypto_level":
             ticker = _btc_or_eth(question)
@@ -482,55 +501,76 @@ def discover_markets(
                 n_bs_filtered += 1
                 continue
 
-            key: tuple[str, str] = (tag, ticker)
+            p_poly = _extract_yes_prob(market) or 0.0
+            gap    = abs(p_poly - p_bs)
+
+            # Short name distinguishing strike and expiry across multiple rows per asset
+            K_str = f"${K/1_000:.0f}k" if K < 1_000_000 else f"${K/1_000_000:.1f}m"
+            name  = f"{ticker} {K_str} by {end_date.strftime('%b %d, %Y')}"
+
+            records.append({
+                "name":            name,
+                "question":        question,
+                "tag":             tag,
+                "ticker":          ticker,
+                "p_poly":          p_poly,
+                "p_prof":          p_bs,
+                "gap":             gap,
+                "volume":          vol,
+                "end_date":        end_date,
+                "resolution_date": str(end_date),
+                "prof_source":     f"Black-Scholes ({sigma_src[ticker]})",
+            })
+            seen_questions.add(question)
 
         elif tag == "rate_decision":
-            key = (tag, "FED")
+            # All qualifying rate_decision contracts share the same pre-fetched Fed data;
+            # include exactly one Fed entry regardless of how many contracts qualify.
+            if fed_added or p_poly_fed is None or p_prof_fed is None:
+                continue
+            records.append({
+                "name":            "Fed Rate Cut 2026",
+                "question":        fed_question,
+                "tag":             "rate_decision",
+                "ticker":          "FED",
+                "p_poly":          p_poly_fed,
+                "p_prof":          p_prof_fed,
+                "gap":             abs(p_poly_fed - p_prof_fed),
+                "volume":          vol,
+                "end_date":        None,
+                "resolution_date": "2026-12-31",
+                "prof_source":     fed_source,
+            })
+            seen_questions.add(question)
+            fed_added = True
 
-        else:
-            continue
-
-        record = {"volume": vol, "question": question, "p_bs": p_bs, "market": market}
-        if key not in best or vol > best[key]["volume"]:
-            best[key] = record
+    # Sort by absolute gap descending — biggest crowd-vs-professional disagreements first
+    records.sort(key=lambda rec: rec["gap"], reverse=True)
 
     # ── Discovery summary ─────────────────────────────────────────────────────
-    W = 66
-    bs_range = f"BS∈[{_BS_P_MIN:.0%},{_BS_P_MAX:.0%}]"
+    W = 72
+    bs_range = f"BS∈[{_BS_P_MIN:.1%},{_BS_P_MAX:.0%}]"
     print(f"\n{'─' * W}")
     print(f"  discover_markets()  "
           f"[vol≥${min_volume_usd/1_000:.0f}k  days≥{min_days}  {bs_range}  pages={max_pages}]")
     print(f"{'─' * W}")
 
-    sorted_groups = sorted(best.items(), key=lambda kv: kv[1]["volume"], reverse=True)
-
-    if not sorted_groups:
+    if not records:
         print(f"  No supported markets found.  ({n_bs_filtered} dropped by BS filter)")
         print(f"{'─' * W}\n")
         return []
 
-    print(f"  {'Type':<18}  {'Asset':<5}  {'P(BS)':>6}  {'Volume':>12}  Question (truncated)")
-    print(f"  {'─'*18}  {'─'*5}  {'─'*6}  {'─'*12}  {'─'*36}")
-    for (tag, ticker), rec in sorted_groups:
-        p_str = f"{rec['p_bs']:.1%}" if rec["p_bs"] is not None else "    —"
-        q     = rec["question"][:48]
-        print(f"  {tag:<18}  {ticker:<5}  {p_str:>6}  ${rec['volume']:>11,.0f}  {q}")
+    print(f"  {'Contract':<28}  {'P(Poly)':>7}  {'P(Prof)':>7}  {'|Gap|':>6}  {'Volume':>12}")
+    print(f"  {'─'*28}  {'─'*7}  {'─'*7}  {'─'*6}  {'─'*12}")
+    for rec in records:
+        print(f"  {rec['name']:<28}  {rec['p_poly']:>7.1%}  {rec['p_prof']:>7.1%}"
+              f"  {rec['gap']:>6.1%}  ${rec['volume']:>11,.0f}")
     print(f"{'─' * W}")
-    print(f"  {len(sorted_groups)} selected  |  {n_bs_filtered} dropped by BS filter  "
-          f"(P(BS) < {_BS_P_MIN:.0%} or > {_BS_P_MAX:.0%})")
+    print(f"  {len(records)} contract(s)  |  {n_bs_filtered} dropped by BS filter"
+          f"  (P(BS) outside [{_BS_P_MIN:.1%}, {_BS_P_MAX:.0%}])")
     print(f"{'─' * W}\n")
 
-    # ── Instantiate ───────────────────────────────────────────────────────────
-    pairs: list[MarketPair] = []
-    for (tag, ticker), _ in sorted_groups:
-        if tag == "crypto_level" and ticker == "BTC":
-            pairs.append(BitcoinMarket())
-        elif tag == "crypto_level" and ticker == "ETH":
-            pairs.append(EthereumMarket())
-        elif tag == "rate_decision":
-            pairs.append(FedRateMarket())
-
-    return pairs
+    return records
 
 
 # ── Demo entrypoints ──────────────────────────────────────────────────────────
@@ -546,20 +586,19 @@ def main() -> None:
 
 
 def discover_main() -> None:
-    """G3 demo: auto-discover markets from the live catalogue, then run the pipeline."""
-    print("CrowdArb G3 — market auto-discovery")
+    """G3 demo: auto-discover markets from the live catalogue and print the ranked table."""
+    print("CrowdArb — market auto-discovery")
     print("=" * 66)
 
-    pairs = discover_markets(min_volume_usd=50_000, min_days=30)
+    records = discover_markets(min_volume_usd=50_000, min_days=30)
 
-    if not pairs:
+    if not records:
         print("No supported markets discovered.")
         return
 
-    print(f"Running pipeline on {len(pairs)} discovered market(s)...\n")
-    for market in pairs:
-        run_crowdarb(market, seed=42, n_steps=200)
-        print()
+    print(f"\n{len(records)} contract(s) discovered, sorted by |gap| descending.")
+    print("Run the Streamlit scanner for the full pipeline view:\n")
+    print("    streamlit run dashboard_scanner.py")
 
 
 if __name__ == "__main__":

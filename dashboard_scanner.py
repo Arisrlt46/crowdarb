@@ -27,27 +27,24 @@ st.title("CrowdArb — Multi-Market Scanner")
 
 @st.cache_data(ttl=300)
 def discover_and_load() -> list[tuple]:
-    """Discover markets from live catalogue then fetch probabilities for each."""
+    """Discover markets from live catalogue; return (name, p_poly, p_prof, meta, err)."""
     try:
-        pairs = discover_markets(min_volume_usd=50_000, min_days=30)
+        records = discover_markets(min_volume_usd=50_000, min_days=30)
     except Exception as exc:
         return [("Discovery", None, None,
                  {"name": "Discovery failed", "description": str(exc),
-                  "resolution_date": "—"}, str(exc))]
+                  "resolution_date": "—", "prof_source": "—"}, str(exc))]
 
+    # discover_markets() already sorted by gap descending; preserve that order.
     results: list[tuple] = []
-    for mp in pairs:
-        # Use class name as fallback so errors are identifiable even without metadata
-        fallback_name = type(mp).__name__
-        fallback_meta = {"name": fallback_name, "description": "—", "resolution_date": "—"}
-        try:
-            p_poly = mp.get_polymarket_probability()
-            p_prof = mp.get_professional_probability()
-            meta   = mp.metadata()
-            results.append((meta["name"], p_poly, p_prof, meta, None))
-        except Exception as exc:
-            # If _ensure_loaded() failed, metadata() would fail too — use fallback
-            results.append((fallback_name, None, None, fallback_meta, str(exc)))
+    for rec in records:
+        meta = {
+            "name":            rec["name"],
+            "description":     rec["question"],
+            "resolution_date": rec["resolution_date"],
+            "prof_source":     rec["prof_source"],
+        }
+        results.append((rec["name"], rec["p_poly"], rec["p_prof"], meta, None))
 
     return results
 
