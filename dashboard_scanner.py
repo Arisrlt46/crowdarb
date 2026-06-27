@@ -145,7 +145,7 @@ if not ok_markets:
     st.warning("No markets loaded successfully. Check API connectivity and try refreshing.")
     st.stop()
 
-selected = st.selectbox("Select market", list(ok_markets))
+selected = st.selectbox("Select market", list(ok_markets), key="market_detail_select")
 p_poly, p_prof, meta = ok_markets[selected]
 p_blend    = 0.5 * p_poly + 0.5 * p_prof
 gap_signed = p_poly - p_prof
@@ -200,10 +200,12 @@ if st.button("Score", key=f"score_{selected}", disabled=not bool(headline)):
             prior  = BetaBelief.from_price(p_blend, strength=10.0)
             signal = score_headline(headline, client, market_type=market_type)
             st.session_state[scorer_key] = {
-                "headline":  headline,
-                "prior":     prior,
-                "signal":    signal,
-                "posterior": lr_update(prior, signal.likelihood_ratio),
+                "headline":    headline,
+                "prior":       prior,
+                "signal":      signal,
+                "posterior":   lr_update(prior, signal.likelihood_ratio),
+                "scored_market": selected,      # which market this result belongs to
+                "market_type":   market_type,   # which prompt was used
             }
         except Exception as exc:
             st.error(f"Scoring failed: {exc}")
@@ -214,6 +216,10 @@ if result is not None:
     posterior = result["posterior"]
     signal    = result["signal"]
     shift     = posterior.mean - prior.mean
+
+    scored_type = result.get("market_type", "rate_decision")
+    prompt_label = "crypto" if scored_type == "crypto_level" else "Fed/rates"
+    st.caption(f"Prompt: **{prompt_label}** · scored for: **{result.get('scored_market', '—')}**")
 
     r1, r2, r3 = st.columns(3)
     r1.metric("Prior P",           f"{prior.mean:.4f}")
