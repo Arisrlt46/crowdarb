@@ -43,6 +43,7 @@ def discover_and_load() -> list[tuple]:
             "description":     rec["question"],
             "resolution_date": rec["resolution_date"],
             "prof_source":     rec["prof_source"],
+            "tag":             rec["tag"],
         }
         results.append((rec["name"], rec["p_poly"], rec["p_prof"], meta, None))
 
@@ -183,18 +184,21 @@ headline_key = f"headline_{selected}"
 if scorer_key not in st.session_state:
     st.session_state[scorer_key] = None
 
-headline = st.text_input(
-    "News headline",
-    placeholder="e.g. Fed signals rate cut amid cooling inflation data",
-    key=headline_key,
+market_type = meta.get("tag", "rate_decision")
+placeholder = (
+    "e.g. Bitcoin ETF inflows hit record high amid institutional demand"
+    if market_type == "crypto_level"
+    else "e.g. Fed signals rate cut amid cooling inflation data"
 )
+
+headline = st.text_input("News headline", placeholder=placeholder, key=headline_key)
 
 if st.button("Score", key=f"score_{selected}", disabled=not bool(headline)):
     with st.spinner("Scoring…"):
         try:
             client = anthropic.Anthropic()
             prior  = BetaBelief.from_price(p_blend, strength=10.0)
-            signal = score_headline(headline, client)
+            signal = score_headline(headline, client, market_type=market_type)
             st.session_state[scorer_key] = {
                 "headline":  headline,
                 "prior":     prior,
@@ -219,8 +223,3 @@ if result is not None:
 
     if result["headline"] != headline:
         st.caption(f'_Showing result for: "{result["headline"]}"_')
-
-st.caption(
-    "Scorer prompt is calibrated for rate-cut signals. "
-    "For crypto markets, interpret LR > 1 as bullish and LR < 1 as bearish."
-)

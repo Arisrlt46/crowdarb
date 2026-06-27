@@ -11,12 +11,26 @@ from layer1_belief import BetaBelief
 MODEL = "claude-opus-4-8"
 DEFAULT_PRIOR_P = 0.72  # fallback prior if no market feed is available
 
-SYSTEM = (
+# Fed / rates: headline scored against a 25 bp rate-cut event
+_SYSTEM_FED = (
     "You are a central-bank analyst scoring Fed news headlines for a rate-cut prediction market. "
     "Given a headline, return LR = P(headline | rate cut) / P(headline | no rate cut). "
     "LR > 1 means the headline is more consistent with a cut; LR < 1 means the opposite. "
     "Clamp LR to [0.1, 10.0]. Provide exactly one sentence of justification."
 )
+
+# Crypto: headline scored against an asset reaching a specific price target
+_SYSTEM_CRYPTO = (
+    "You are a crypto-markets analyst scoring news headlines for a binary price-level prediction market. "
+    "Given a headline, return LR = P(headline | asset reaches its price target) / P(headline | asset does not). "
+    "LR > 1 means the headline is bullish and makes the target more likely; LR < 1 means bearish. "
+    "Clamp LR to [0.1, 10.0]. Provide exactly one sentence of justification."
+)
+
+_SYSTEMS: dict[str, str] = {
+    "rate_decision": _SYSTEM_FED,
+    "crypto_level":  _SYSTEM_CRYPTO,
+}
 
 
 class LLMSignal(BaseModel):
@@ -29,12 +43,17 @@ class LLMSignal(BaseModel):
     )
 
 
-def score_headline(headline: str, client: anthropic.Anthropic) -> LLMSignal:
-    """Return a structured LLM signal for a news headline."""
+def score_headline(
+    headline: str,
+    client: anthropic.Anthropic,
+    market_type: str = "rate_decision",
+) -> LLMSignal:
+    """Return a structured LLM signal for a news headline using the market-appropriate prompt."""
+    system = _SYSTEMS.get(market_type, _SYSTEM_FED)
     response = client.messages.parse(
         model=MODEL,
         max_tokens=256,
-        system=SYSTEM,
+        system=system,
         messages=[{"role": "user", "content": f'Headline: "{headline}"'}],
         output_format=LLMSignal,
     )
