@@ -462,6 +462,7 @@ def discover_markets(
     # ── Scan, classify, collect all passing contracts ─────────────────────────
     records:       list[dict] = []
     seen_questions: set[str]  = set()   # exact-duplicate guard (same contract, two API pages)
+    used_names:    set[str]   = set()   # display-name uniqueness guard
     fed_added      = False              # include at most one Fed entry
     n_bs_filtered  = 0
 
@@ -504,9 +505,19 @@ def discover_markets(
             p_poly = _extract_yes_prob(market) or 0.0
             gap    = abs(p_poly - p_bs)
 
-            # Short name distinguishing strike and expiry across multiple rows per asset
-            K_str = f"${K/1_000:.0f}k" if K < 1_000_000 else f"${K/1_000_000:.1f}m"
-            name  = f"{ticker} {K_str} by {end_date.strftime('%b %d, %Y')}"
+            # Short name: ticker + strike + expiry; append volume suffix on collision
+            K_str    = f"${K/1_000:.0f}k" if K < 1_000_000 else f"${K/1_000_000:.1f}m"
+            name     = f"{ticker} {K_str} by {end_date.strftime('%b %d, %Y')}"
+            vol_tag  = f"·${vol/1_000:.0f}k"
+            if name in used_names:
+                # Retroactively disambiguate the earlier entry with the same label
+                for prev in records:
+                    if prev["name"] == name:
+                        prev["name"] = name + f"·${prev['volume']/1_000:.0f}k"
+                        used_names.add(prev["name"])
+                        break
+                name = name + vol_tag
+            used_names.add(name)
 
             records.append({
                 "name":            name,
