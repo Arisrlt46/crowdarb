@@ -45,6 +45,7 @@ from layer1_backtest import brier_score, generate_price_series, log_loss, run_ba
 from layer1_belief import BetaBelief, NaiveMarketMaker
 from layer2_avellaneda import ASParams, AvellanedaStoikovMM, estimate_sigma2, run_as_backtest
 from layer3_calibration import BayesianBlender
+from layer5_interpret import MarketSignals, format_interpretation, interpret
 
 
 # ── Abstract interface ────────────────────────────────────────────────────────
@@ -358,6 +359,26 @@ def run_crowdarb(
     print(f"    Blended Brier       : {bs_blend:.4f}  ({improvement:+.1f}% vs Polymarket alone)")
     print(f"    Learned-weight blend: {p_blend_learned:.4f}  ({p_blend_learned:.1%})")
     print("=" * W)
+
+    # ── Layer 5 — plain-language interpretation ───────────────────────────────
+    trusted = "Polymarket" if ws["polymarket"] >= ws["professional"] else "Professional"
+    sig = MarketSignals(
+        name              = meta["name"],
+        description       = meta.get("description", ""),
+        resolution_date   = str(meta.get("resolution_date", "")),
+        prof_source       = meta.get("prof_source", ""),
+        tag               = meta.get("tag", ""),
+        p_poly            = p_poly,
+        p_prof            = p_prof,
+        p_blend           = p_blend_learned,
+        trusted_source    = trusted,
+        poly_weight       = ws["polymarket"],
+        prof_weight       = ws["professional"],
+        reservation_price = as_mm.reservation_price,
+        spread            = as_mm.spread,
+        mid               = p_blend,
+    )
+    print(format_interpretation(interpret(sig)))
 
 
 # ── Market auto-discovery (G3) ────────────────────────────────────────────────

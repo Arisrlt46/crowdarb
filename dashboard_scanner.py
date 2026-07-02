@@ -16,6 +16,7 @@ from layer1_belief import BetaBelief
 from layer2_avellaneda import ASParams, AvellanedaStoikovMM, estimate_sigma2
 from layer3_calibration import BayesianBlender
 from layer4_llm_signal import lr_update, score_headline
+from layer5_interpret import GLOSSARY, MarketSignals, compact_read, interpret, narrate
 
 st.set_page_config(page_title="CrowdArb Scanner", layout="wide")
 st.title("CrowdArb — Multi-Market Scanner")
@@ -53,8 +54,8 @@ def discover_and_load() -> list[tuple]:
 # ── Deterministic helpers (cached indefinitely — inputs fully determine outputs) ─
 
 @st.cache_data
-def _hedge_trusted(p_poly: float, p_prof: float) -> str:
-    """Run 200-step Hedge simulation; return name of the higher-weight source."""
+def _hedge_weights(p_poly: float, p_prof: float) -> tuple[float, float]:
+    """Run 200-step Hedge simulation; return (w_poly, w_prof)."""
     rng        = np.random.default_rng(42)
     p_blend    = 0.5 * p_poly + 0.5 * p_prof
     p_poly_sim = np.clip(rng.normal(p_poly, max(p_poly * 0.30, 0.005), 200), 0.001, 0.999)
@@ -64,7 +65,14 @@ def _hedge_trusted(p_poly: float, p_prof: float) -> str:
     for pp, pr, y in zip(p_poly_sim, p_prof_sim, outcomes):
         blender.update([pp, pr], y)
     ws = blender.weight_dict()
-    return "Polymarket" if ws["polymarket"] >= ws["professional"] else "Professional"
+    return ws["polymarket"], ws["professional"]
+
+
+@st.cache_data
+def _hedge_trusted(p_poly: float, p_prof: float) -> str:
+    """Return name of the higher-weight source; derived from _hedge_weights."""
+    w_poly, _ = _hedge_weights(p_poly, p_prof)
+    return "Polymarket" if w_poly >= 0.5 else "Professional"
 
 
 @st.cache_data
@@ -104,12 +112,21 @@ for name, p_poly, p_prof, meta, err in market_results:
     if err:
         load_errors.append((name, err))
         rows.append({"Market": name, "Polymarket": None, "Professional": None,
-                     "|Gap|": None, "Trusted (Hedge)": "—", "_sort": -1.0})
+                     "|Gap|": None, "Trusted (Hedge)": "—", "Read": "—", "_sort": -1.0})
     else:
-        gap = abs(p_poly - p_prof)
+        gap     = abs(p_poly - p_prof)
+        trusted = _hedge_trusted(p_poly, p_prof)
+        _sig    = MarketSignals(
+            name=name, description="", resolution_date="",
+            prof_source=meta.get("prof_source", ""),
+            tag=meta.get("tag", ""),
+            p_poly=p_poly, p_prof=p_prof,
+            p_blend=0.5 * p_poly + 0.5 * p_prof,
+            trusted_source=trusted,
+        )
         rows.append({"Market": name, "Polymarket": p_poly, "Professional": p_prof,
-                     "|Gap|": gap, "Trusted (Hedge)": _hedge_trusted(p_poly, p_prof),
-                     "_sort": gap})
+                     "|Gap|": gap, "Trusted (Hedge)": trusted,
+                     "Read": compact_read(_sig), "_sort": gap})
 
 df_raw = (
     pd.DataFrame(rows)
@@ -158,21 +175,83 @@ st.caption(
 st.write("")
 
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("Polymarket",        f"{p_poly:.1%}")
-c2.metric("Professional",      f"{p_prof:.1%}")
-c3.metric("Gap (Poly − Prof)", f"{gap_signed:+.1%}")
-c4.metric("Blended (50/50)",   f"{p_blend:.1%}")
+c1.metric("Polymarket",        f"{p_poly:.1%}",      help=GLOSSARY["Polymarket probability"])
+c2.metric("Professional",      f"{p_prof:.1%}",      help=GLOSSARY["Professional probability"])
+c3.metric("Gap (Poly − Prof)", f"{gap_signed:+.1%}", help=GLOSSARY["Gap"])
+c4.metric("Blended (50/50)",   f"{p_blend:.1%}",     help=GLOSSARY["Blended"])
 
 st.divider()
 
 st.subheader("Avellaneda-Stoikov Quotes")
 bid, ask, spread, r_price = _as_quotes(p_blend)
 q1, q2, q3, q4 = st.columns(4)
-q1.metric("Bid",               f"{bid:.4f}")
-q2.metric("Ask",               f"{ask:.4f}")
-q3.metric("Spread",            f"{spread:.4f}")
-q4.metric("Reservation price", f"{r_price:.4f}")
+q1.metric("Bid",               f"{bid:.4f}",     help=GLOSSARY["Bid"])
+q2.metric("Ask",               f"{ask:.4f}",     help=GLOSSARY["Ask"])
+q3.metric("Spread",            f"{spread:.4f}",  help=GLOSSARY["Spread"])
+q4.metric("Reservation price", f"{r_price:.4f}", help=GLOSSARY["Reservation price"])
 st.caption(f"From blended prior p₀ = {p_blend:.4f}, zero inventory, γ=10, k=45")
+
+st.divider()
+
+# ── What these numbers mean ───────────────────────────────────────────────────
+st.subheader("What these numbers mean")
+
+# Read LLM signal from session state — populated after the user scores a headline below.
+_llm_result = st.session_state.get(f"llm_{selected}")
+_llm_lr     = _llm_result["signal"].likelihood_ratio if _llm_result else None
+_llm_just   = _llm_result["signal"].justification    if _llm_result else None
+
+w_poly, w_prof = _hedge_weights(p_poly, p_prof)
+trusted = "Polymarket" if w_poly >= w_prof else "Professional"
+
+sig = MarketSignals(
+    name              = selected,
+    description       = meta.get("description", ""),
+    resolution_date   = str(meta.get("resolution_date", "")),
+    prof_source       = meta.get("prof_source", ""),
+    tag               = meta.get("tag", ""),
+    p_poly            = p_poly,
+    p_prof            = p_prof,
+    p_blend           = p_blend,
+    trusted_source    = trusted,
+    poly_weight       = w_poly,
+    prof_weight       = w_prof,
+    reservation_price = r_price,
+    spread            = spread,
+    mid               = p_blend,
+    llm_lr            = _llm_lr,
+    llm_justification = _llm_just,
+)
+interp = interpret(sig)
+
+if interp.direction == "aligned":
+    st.success(interp.verdict)
+else:
+    st.info(interp.verdict)
+
+for line in interp.lines:
+    st.markdown(f"- {line}")
+
+# Optional LLM narrative — one API call per explicit click, cached per market
+narrate_key = f"narrate_{selected}"
+if narrate_key not in st.session_state:
+    st.session_state[narrate_key] = None
+
+if st.button("Explain in plain English", key=f"narrate_btn_{selected}"):
+    with st.spinner("Generating explanation…"):
+        try:
+            _nc = anthropic.Anthropic()
+            st.session_state[narrate_key] = narrate(sig, interp, _nc)
+        except Exception as exc:
+            st.error(f"Explanation failed: {exc}")
+st.caption("Uses the Anthropic API · one call per click")
+
+if st.session_state[narrate_key]:
+    st.info(st.session_state[narrate_key])
+
+with st.expander("Glossary — what do these numbers mean?"):
+    for term, definition in interp.glossary.items():
+        st.markdown(f"**{term}:** {definition}")
 
 st.divider()
 
@@ -224,7 +303,7 @@ if result is not None:
     r1, r2, r3 = st.columns(3)
     r1.metric("Prior P",           f"{prior.mean:.4f}")
     r2.metric("Posterior P",       f"{posterior.mean:.4f}", delta=f"{shift:+.4f}")
-    r3.metric("Likelihood ratio",  f"{signal.likelihood_ratio:.3f}")
+    r3.metric("Likelihood ratio",  f"{signal.likelihood_ratio:.3f}", help=GLOSSARY["Likelihood ratio"])
     st.caption(f"**Justification:** {signal.justification}")
 
     if result["headline"] != headline:
